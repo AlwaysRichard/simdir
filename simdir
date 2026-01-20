@@ -1,0 +1,136 @@
+#!/bin/bash
+
+# ==============================================================================
+# simdir - iOS Simulator Directory Manager (Data-First Strategy)
+# ==============================================================================
+
+# 1. SETUP & UTILS
+BASE_DIR="$HOME/Library/Developer/CoreSimulator/Devices"
+
+fail() { echo "Error: $1"; exit 1; }
+log() { echo "Simdir: $1"; }
+
+# 2. DETECT BOOTED SIMULATOR
+DEVICE_INFO=$(xcrun simctl list devices | grep "(Booted)" | grep -v "unavailable")
+DEVICE_COUNT=$(echo "$DEVICE_INFO" | wc -l | xargs)
+
+if [ -z "$DEVICE_INFO" ]; then fail "No simulator is running."; fi
+if [ "$DEVICE_COUNT" -gt 1 ]; then fail "Multiple simulators running. Please shutdown all but one."; fi
+
+UUID=$(echo "$DEVICE_INFO" | sed -E 's/.* \(([0-9A-F-]+)\) \(Booted\).*/\1/')
+NAME=$(echo "$DEVICE_INFO" | sed -E 's/ *([^(]+) \(.*/\1/')
+
+# Define the Data Container Root
+DATA_ROOT="$BASE_DIR/$UUID/data/Containers/Data/Application"
+
+# 3. HELPER: FIND APP DATA PATH BY NAME
+find_app_path() {
+    local search_name=$1
+    
+    for dir in "$DATA_ROOT"/*; do
+        [ -d "$dir" ] || continue
+        
+        # Read the hidden metadata plist to get the real Bundle ID
+        local meta_plist="$dir/.com.apple.mobile_container_manager.metadata.plist"
+        if [ -f "$meta_plist" ]; then
+            local bid=$(defaults read "$meta_plist" MCMMetadataIdentifier 2>/dev/null)
+            
+            # Check if Bundle ID contains the search string (case-insensitive)
+            if [[ "$(echo "$bid" | tr '[:upper:]' '[:lower:]')" == *"$search_name"* ]]; then
+                echo "$bid|$dir"
+                return 0
+            fi
+        fi
+    done
+    return 1
+}
+
+# 4. COMMAND HANDLER
+CMD="$1"
+ARG1="$2"
+ARG2="$3"
+
+if [ "$CMD" == "apps" ]; then
+    log "Scanning active device: $NAME ($UUID)"
+    echo "--- Installed Apps (Data Containers) ---"
+    
+    if [ ! -d "$DATA_ROOT" ]; then fail "No Data containers found on this device."; fi
+
+    for dir in "$DATA_ROOT"/*; do
+        [ -d "$dir" ] || continue
+        meta_plist="$dir/.com.apple.mobile_container_manager.metadata.plist"
+        if [ -f "$meta_plist" ]; then
+            bid=$(defaults read "$meta_plist" MCMMetadataIdentifier 2>/dev/null)
+            if [[ "$bid" != "com.apple."* ]]; then
+                 echo "• $bid"
+                 echo "  Path: $dir"
+            fi
+        fi
+    done
+    exit 0
+fi
+
+# HANDLE FILE OPERATIONS
+SEARCH_NAME="$CMD"
+OPERATION="$ARG1"
+FILE_PATH="$ARG2"
+
+if [ -z "$SEARCH_NAME" ]; then
+    echo "Usage: simdir <app-name> [ls|cp|get|rm] [file]"
+    echo "       simdir apps"
+    exit 1
+fi
+
+# Find the app
+RESULT=$(find_app_path "$(echo "$SEARCH_NAME" | tr '[:upper:]' '[:lower:]')")
+
+if [ -z "$RESULT" ]; then
+    fail "Could not find an app matching '$SEARCH_NAME' on device '$NAME'."
+fi
+
+APP_ID=${RESULT%|*}
+APP_PATH=${RESULT#*|}
+
+log "Target: $APP_ID"
+
+case "$OPERATION" in
+    ls)
+        echo "--- Documents Directory ---"
+	ls -FGlAh "$APP_PATH/Documents" 2>/dev/null | tail -n +2
+        ;;
+    cp)
+        if [ -z "$FILE_PATH" ]; then fail "Missing source file path."; fi
+        cp -r "$FILE_PATH" "$APP_PATH/Documents/" && echo "Success: Copied to App Documents."
+        ;;
+    get)
+        if [ -z "$FILE_PATH" ]; then fail "Missing filename to get."; fi
+        if [ -e "$APP_PATH/Documents/$FILE_PATH" ]; then
+            cp -r "$APP_PATH/Documents/$FILE_PATH" .
+        elif [ -e "$APP_PATH/tmp/$FILE_PATH" ]; then
+            cp -r "$APP_PATH/tmp/$FILE_PATH" .
+        else
+            fail "File '$FILE_PATH' not found in App container."
+        fi
+        echo "Success: Retrieved '$FILE_PATH'."
+        ;;
+    rm|del)
+        if [ -z "$FILE_PATH" ]; then fail "Missing filename to remove."; fi
+        
+        TARGET_DOC="$APP_PATH/Documents/$FILE_PATH"
+        TARGET_TMP="$APP_PATH/tmp/$FILE_PATH"
+        
+        if [ -e "$TARGET_DOC" ]; then
+            rm -rf "$TARGET_DOC"
+            echo "Success: Removed '$FILE_PATH' from Documents."
+        elif [ -e "$TARGET_TMP" ]; then
+            rm -rf "$TARGET_TMP"
+            echo "Success: Removed '$FILE_PATH' from tmp."
+        else
+            fail "File '$FILE_PATH' not found in Documents or tmp."
+        fi
+        ;;
+    *)
+        echo "Path:    $APP_PATH"
+        echo "Usage:   simdir $SEARCH_NAME [ls | cp <file> | get <file> | rm <file>]"
+        ;;
+esac
