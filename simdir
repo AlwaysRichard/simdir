@@ -1,136 +1,272 @@
 #!/bin/bash
 
 # ==============================================================================
-# simdir - iOS Simulator Directory Manager (Data-First Strategy)
+# simdir - iOS Simulator Directory Manager
 # ==============================================================================
 
-# 1. SETUP & UTILS
 BASE_DIR="$HOME/Library/Developer/CoreSimulator/Devices"
 
 fail() { echo "Error: $1"; exit 1; }
 log() { echo "Simdir: $1"; }
 
-# 2. DETECT BOOTED SIMULATOR
-DEVICE_INFO=$(xcrun simctl list devices | grep "(Booted)" | grep -v "unavailable")
-DEVICE_COUNT=$(echo "$DEVICE_INFO" | wc -l | xargs)
+# 1. ARGUMENT PARSING
+TARGET_DEVICE_FILTER=""
+ONLY_BOOTED=false
 
-if [ -z "$DEVICE_INFO" ]; then fail "No simulator is running."; fi
-if [ "$DEVICE_COUNT" -gt 1 ]; then fail "Multiple simulators running. Please shutdown all but one."; fi
+# Store arguments in an array to preserve them after extraction
+args=()
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --booted)
+            ONLY_BOOTED=true
+            shift
+            ;;
+        --device)
+            TARGET_DEVICE_FILTER="$2"
+            shift 2
+            ;;
+        *)
+            args+=("$1")
+            shift
+            ;;
+    esac
+done
 
-UUID=$(echo "$DEVICE_INFO" | sed -E 's/.* \(([0-9A-F-]+)\) \(Booted\).*/\1/')
-NAME=$(echo "$DEVICE_INFO" | sed -E 's/ *([^(]+) \(.*/\1/')
+# Restore positional parameters
+set -- "${args[@]}"
 
-# Define the Data Container Root
-DATA_ROOT="$BASE_DIR/$UUID/data/Containers/Data/Application"
-
-# 3. HELPER: FIND APP DATA PATH BY NAME
-find_app_path() {
-    local search_name=$1
-    
-    for dir in "$DATA_ROOT"/*; do
-        [ -d "$dir" ] || continue
-        
-        # Read the hidden metadata plist to get the real Bundle ID
-        local meta_plist="$dir/.com.apple.mobile_container_manager.metadata.plist"
-        if [ -f "$meta_plist" ]; then
-            local bid=$(defaults read "$meta_plist" MCMMetadataIdentifier 2>/dev/null)
-            
-            # Check if Bundle ID contains the search string (case-insensitive)
-            if [[ "$(echo "$bid" | tr '[:upper:]' '[:lower:]')" == *"$search_name"* ]]; then
-                echo "$bid|$dir"
-                return 0
-            fi
-        fi
-    done
-    return 1
-}
-
-# 4. COMMAND HANDLER
 CMD="$1"
 ARG1="$2"
-ARG2="$3"
+SRC="$3"
+DEST="$4"
 
-if [ "$CMD" == "apps" ]; then
-    log "Scanning active device: $NAME ($UUID)"
-    echo "--- Installed Apps (Data Containers) ---"
+if [ -z "$CMD" ]; then
+    echo "Usage: simdir [options] apps"
+    echo "       simdir [options] <app-name> [ls|rm] [path]"
+    echo "       simdir [options] <app-name> cp <src> <dest>"
+    echo ""
+    echo "Options:"
+    echo "  --booted            Scan only booted simulators"
+    echo "  --device <id>       Scan specific device by Short UUID (e.g., 72F0533F)"
+    exit 1
+fi
+
+# 2. CACHE BOOTED DEVICES (For display and filtering)
+# We capture the full list of booted UUIDs to quickly check status later
+BOOTED_UUIDS=$(xcrun simctl list devices | grep "(Booted)" | awk -F '[()]' '{print $(NF-3)}')
+
+# 3. HELPER: GET TARGET DEVICES
+get_target_devices() {
+    # If a specific device short-code is requested
+    if [ -n "$TARGET_DEVICE_FILTER" ]; then
+        # Find directory matching the partial UUID
+        local match=$(find "$BASE_DIR" -maxdepth 1 -name "*$TARGET_DEVICE_FILTER*" | head -n 1)
+        if [ -d "$match" ]; then
+            echo "$match"
+        else
+            fail "Device with ID matching '$TARGET_DEVICE_FILTER' not found."
+        fi
+        return
+    fi
+
+    # If --booted is requested
+    if [ "$ONLY_BOOTED" = true ]; then
+        if [ -z "$BOOTED_UUIDS" ]; then fail "No simulator is running."; fi
+        for uuid in $BOOTED_UUIDS; do
+            echo "$BASE_DIR/$uuid"
+        done
+        return
+    fi
+
+    # Default: Return all
+    for d in "$BASE_DIR"/*; do
+        if [ -d "$d" ]; then echo "$d"; fi
+    done
+}
+
+# 4. HELPER: GET DEVICE INFO (Name, Runtime, ShortID)
+get_device_info() {
+    local dev_dir=$1
+    local plist="$dev_dir/device.plist"
+    local uuid=$(basename "$dev_dir")
+    local short_id="${uuid:0:8}"
     
-    if [ ! -d "$DATA_ROOT" ]; then fail "No Data containers found on this device."; fi
+    local name="Unknown"
+    local runtime="Unknown"
+    
+    if [ -f "$plist" ]; then
+        name=$(defaults read "$plist" name 2>/dev/null)
+        # Extract runtime version (e.g., com.apple.CoreSimulator.SimRuntime.iOS-16-2 -> iOS-16-2)
+        runtime=$(defaults read "$plist" runtime 2>/dev/null | awk -F'.' '{print $NF}')
+    fi
+    
+    # Check if this specific UUID is in our booted list
+    local status=""
+    if [[ "$BOOTED_UUIDS" == *"$uuid"* ]]; then
+        status=" ** Booted"
+    fi
 
-    for dir in "$DATA_ROOT"/*; do
-        [ -d "$dir" ] || continue
-        meta_plist="$dir/.com.apple.mobile_container_manager.metadata.plist"
-        if [ -f "$meta_plist" ]; then
-            bid=$(defaults read "$meta_plist" MCMMetadataIdentifier 2>/dev/null)
-            if [[ "$bid" != "com.apple."* ]]; then
-                 echo "• $bid"
-                 echo "  Path: $dir"
-            fi
+    echo "$short_id|$name|$runtime|$status"
+}
+
+# 5. COMMAND: APPS
+if [ "$CMD" == "apps" ]; then
+    TARGETS=$(get_target_devices)
+    
+    for dev_dir in $TARGETS; do
+        DATA_ROOT="$dev_dir/data/Containers/Data/Application"
+        
+        # Only process if apps exist
+        if [ -d "$DATA_ROOT" ] && [ "$(ls -A $DATA_ROOT)" ]; then
+            # Parse Device Info
+            INFO=$(get_device_info "$dev_dir")
+            SHORT_ID=$(echo "$INFO" | cut -d'|' -f1)
+            NAME=$(echo "$INFO" | cut -d'|' -f2)
+            RUNTIME=$(echo "$INFO" | cut -d'|' -f3)
+            STATUS=$(echo "$INFO" | cut -d'|' -f4)
+            
+            echo "Device: $SHORT_ID $NAME ($RUNTIME)$STATUS"
+            
+            for dir in "$DATA_ROOT"/*; do
+                [ -d "$dir" ] || continue
+                meta_plist="$dir/.com.apple.mobile_container_manager.metadata.plist"
+                
+                if [ -f "$meta_plist" ]; then
+                    bid=$(defaults read "$meta_plist" MCMMetadataIdentifier 2>/dev/null)
+                    if [[ "$bid" != "com.apple."* ]]; then
+                         echo "  • $bid"
+                    fi
+                fi
+            done
+            echo "" 
         fi
     done
     exit 0
 fi
 
-# HANDLE FILE OPERATIONS
+# 6. LOCATE APP
 SEARCH_NAME="$CMD"
 OPERATION="$ARG1"
-FILE_PATH="$ARG2"
 
-if [ -z "$SEARCH_NAME" ]; then
-    echo "Usage: simdir <app-name> [ls|cp|get|rm] [file]"
-    echo "       simdir apps"
-    exit 1
-fi
+# find_app_path helper
+find_app_path() {
+    local search_name=$1
+    local device_paths=$(get_target_devices)
+    
+    for dev_dir in $device_paths; do
+        local data_root="$dev_dir/data/Containers/Data/Application"
+        if [ -d "$data_root" ]; then
+            for app_dir in "$data_root"/*; do
+                [ -d "$app_dir" ] || continue
+                local meta_plist="$app_dir/.com.apple.mobile_container_manager.metadata.plist"
+                if [ -f "$meta_plist" ]; then
+                    local bid=$(defaults read "$meta_plist" MCMMetadataIdentifier 2>/dev/null)
+                    if [[ "$(echo "$bid" | tr '[:upper:]' '[:lower:]')" == *"$search_name"* ]]; then
+                        echo "$bid|$app_dir|$dev_dir"
+                        return 0
+                    fi
+                fi
+            done
+        fi
+    done
+    return 1
+}
 
-# Find the app
 RESULT=$(find_app_path "$(echo "$SEARCH_NAME" | tr '[:upper:]' '[:lower:]')")
 
 if [ -z "$RESULT" ]; then
-    fail "Could not find an app matching '$SEARCH_NAME' on device '$NAME'."
+    fail "Could not find an app matching '$SEARCH_NAME'."
 fi
 
-APP_ID=${RESULT%|*}
-APP_PATH=${RESULT#*|}
+APP_ID=$(echo "$RESULT" | cut -d'|' -f1)
+APP_PATH=$(echo "$RESULT" | cut -d'|' -f2)
+DEV_DIR=$(echo "$RESULT" | cut -d'|' -f3)
+INFO=$(get_device_info "$DEV_DIR")
+SHORT_ID=$(echo "$INFO" | cut -d'|' -f1)
+DEV_NAME=$(echo "$INFO" | cut -d'|' -f2)
 
-log "Target: $APP_ID"
+# Only log target if not doing simple ls (keeps output clean)
+if [ "$OPERATION" != "ls" ]; then
+    log "Target: $APP_ID on $DEV_NAME ($SHORT_ID)"
+fi
 
 case "$OPERATION" in
     ls)
-        echo "--- Documents Directory ---"
-	ls -FGlAh "$APP_PATH/Documents" 2>/dev/null | tail -n +2
-        ;;
-    cp)
-        if [ -z "$FILE_PATH" ]; then fail "Missing source file path."; fi
-        cp -r "$FILE_PATH" "$APP_PATH/Documents/" && echo "Success: Copied to App Documents."
-        ;;
-    get)
-        if [ -z "$FILE_PATH" ]; then fail "Missing filename to get."; fi
-        if [ -e "$APP_PATH/Documents/$FILE_PATH" ]; then
-            cp -r "$APP_PATH/Documents/$FILE_PATH" .
-        elif [ -e "$APP_PATH/tmp/$FILE_PATH" ]; then
-            cp -r "$APP_PATH/tmp/$FILE_PATH" .
+        SUBDIR="$SRC" # In ls command, ARG3 (SRC) is the optional directory
+        TARGET_DIR="$APP_PATH/Documents"
+        
+        if [ -n "$SUBDIR" ]; then
+            # Try Documents/SUBDIR first, then AppRoot/SUBDIR
+            if [ -d "$APP_PATH/Documents/$SUBDIR" ]; then
+                TARGET_DIR="$APP_PATH/Documents/$SUBDIR"
+                echo "--- Documents/$SUBDIR ---"
+            elif [ -d "$APP_PATH/$SUBDIR" ]; then
+                TARGET_DIR="$APP_PATH/$SUBDIR"
+                echo "--- AppRoot/$SUBDIR ---"
+            else
+                fail "Directory '$SUBDIR' not found."
+            fi
         else
-            fail "File '$FILE_PATH' not found in App container."
+            echo "--- Documents Directory ---"
         fi
-        echo "Success: Retrieved '$FILE_PATH'."
+        ls -FGlAh "$TARGET_DIR" 2>/dev/null | tail -n +2
         ;;
+        
+    cp)
+        # Usage: cp <src> <dest>
+        # Logic: Determine direction based on local file existence
+        
+        if [ -z "$SRC" ] || [ -z "$DEST" ]; then
+            fail "Usage: cp <from> <to>"
+        fi
+
+        # Case A: PUSH (Local -> App)
+        # We assume if the source exists locally on your mac, you mean to push it.
+        if [ -e "$SRC" ]; then
+             # If Dest ends in / or is '.', treat it as a directory inside Documents
+             if [[ "$DEST" == */ ]] || [[ "$DEST" == "." ]]; then
+                 TARGET="$APP_PATH/Documents/$DEST"
+             else
+                 # It might be a full filename path inside Documents
+                 TARGET="$APP_PATH/Documents/$DEST"
+             fi
+             
+             cp -r "$SRC" "$TARGET" && echo "Success: Pushed '$SRC' to App."
+             
+        # Case B: PULL (App -> Local)
+        # If source does NOT exist locally, we assume it's a file inside the App
+        else
+             # Check Documents first
+             if [ -e "$APP_PATH/Documents/$SRC" ]; then
+                 REAL_SRC="$APP_PATH/Documents/$SRC"
+             elif [ -e "$APP_PATH/tmp/$SRC" ]; then
+                 REAL_SRC="$APP_PATH/tmp/$SRC"
+             else
+                 fail "Source '$SRC' not found locally or in App Documents/tmp."
+             fi
+             
+             cp -r "$REAL_SRC" "$DEST" && echo "Success: Pulled '$SRC' from App."
+        fi
+        ;;
+        
     rm|del)
+        FILE_PATH="$SRC"
         if [ -z "$FILE_PATH" ]; then fail "Missing filename to remove."; fi
         
         TARGET_DOC="$APP_PATH/Documents/$FILE_PATH"
         TARGET_TMP="$APP_PATH/tmp/$FILE_PATH"
         
         if [ -e "$TARGET_DOC" ]; then
-            rm -rf "$TARGET_DOC"
-            echo "Success: Removed '$FILE_PATH' from Documents."
+            rm -rf "$TARGET_DOC" && echo "Removed '$FILE_PATH' from Documents."
         elif [ -e "$TARGET_TMP" ]; then
-            rm -rf "$TARGET_TMP"
-            echo "Success: Removed '$FILE_PATH' from tmp."
+            rm -rf "$TARGET_TMP" && echo "Removed '$FILE_PATH' from tmp."
         else
-            fail "File '$FILE_PATH' not found in Documents or tmp."
+            fail "File '$FILE_PATH' not found."
         fi
         ;;
     *)
         echo "Path:    $APP_PATH"
-        echo "Usage:   simdir $SEARCH_NAME [ls | cp <file> | get <file> | rm <file>]"
+        echo "Usage:   simdir [options] $SEARCH_NAME [ls|rm] [path]"
+        echo "Usage:   simdir [options] $SEARCH_NAME cp <src> <dest>"
         ;;
 esac
